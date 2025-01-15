@@ -157,3 +157,7 @@ def load_docx(file_path):
     """Load content from a DOCX file."""
     doc = Document(file_path)
     return "\n".join([para.text for para in doc.paragraphs])
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
