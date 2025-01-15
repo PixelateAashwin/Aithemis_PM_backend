@@ -17,6 +17,11 @@ app.use(morgan('dev'));
 app.use('/api/files', fileRouter);
 app.use('/api/search', searchRouter);
 
+app.use('/api/health', (req, res) => {
+  res.status(200).json({ status: 'success', message: 'Server is healthy' });
+});// give get request to user
+
+
 // Handle 404
 app.all('*', (req, res, next) => {
   next(new AppError(`Cannot find ${req.originalUrl} on this server`, 404));

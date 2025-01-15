@@ -11,7 +11,7 @@ export const sendFileToFastAPI = async (fileBuffer, fileName) => {
   form.append('file', fileBuffer, fileName);
 
   try {
-    const response = await axios.post('http://127.0.0.1:8000/upload', form, {
+    const response = await axios.post('https://aithemis-pm-backend-1.onrender.com/upload', form, {
       headers: {
         ...form.getHeaders(),
       },
@@ -27,7 +27,7 @@ export const sendFileToFastAPI = async (fileBuffer, fileName) => {
 export const searchInDocuments = async (query) => {
   try {
     const response = await axios.post(
-      'http://localhost:8000/search',
+      'https://aithemis-pm-backend-1.onrender.com/search',
       { query: query },
       {
         headers: {
