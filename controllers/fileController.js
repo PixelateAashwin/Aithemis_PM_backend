@@ -4,6 +4,8 @@ import AppError from '../utils/appError.js';
 import catchAsync from '../utils/catchAsync.js';
 import axios from 'axios';
 import FormData from 'form-data';
+import dotenv from 'dotenv';
+dotenv.config();
 
 // Send file to FastAPI for processing
 export const sendFileToFastAPI = async (fileBuffer, fileName) => {
@@ -11,24 +13,22 @@ export const sendFileToFastAPI = async (fileBuffer, fileName) => {
   form.append('file', fileBuffer, fileName);
 
   try {
-    const response = await axios.post('https://aithemis-pm-backend-1.onrender.com/upload', form, {
+    const response = await axios.post(process.env.PYTHON_UPLOAD, form, {
       headers: {
         ...form.getHeaders(),
       },
     });
     return response.data;
   } catch (error) {
-    console.error('Error uploading file to FastAPI:', error);
     throw new Error('Failed to upload file');
   }
 };
 
-// Updated function to search documents in FastAPI
-export const searchInDocuments = async (query) => {
+export const searchInDocuments = async (query, parsedData) => {
   try {
     const response = await axios.post(
-      'https://aithemis-pm-backend-1.onrender.com/search',
-      { query: query },
+      process.env.PYTHON_SEARCH,
+      { query, parsedData },
       {
         headers: {
           'Content-Type': 'application/json',
@@ -36,50 +36,73 @@ export const searchInDocuments = async (query) => {
       }
     );
 
-    // Return the complete results object
     return {
-      results: response.data.results,
-      totalResults: response.data.total_results,
-      query: response.data.query,
+      results: response?.data?.results,
+      totalResults: response?.data?.totalResults,
+      query: response?.data?.query,
     };
   } catch (error) {
-    console.error('Error querying documents in FastAPI:', error);
     throw new Error('Failed to query documents');
   }
 };
 
-// Updated controller function to handle the search query
+// Search for documents using stored embeddings
 export const searchDocuments = async (req, res) => {
   try {
-    const { query } = req.body;
-    console.log('Received search query:', query);
+    const { query, documentIds } = req.body;
 
-    if (!query) {
-      return res.status(400).json({ error: 'Query is required' });
+    if (!query || !documentIds || !Array.isArray(documentIds)) {
+      return res
+        .status(400)
+        .json({ error: 'Query and valid document IDs are required' });
     }
 
-    // Get search results from FastAPI
-    const searchResponse = await searchInDocuments(query);
+    const documents = await Document.find({ _id: { $in: documentIds } });
 
-    // Return formatted response
-    return res.json({
+    if (!documents.length) {
+      return res
+        .status(404)
+        .json({ error: 'No documents found for the provided IDs' });
+    }
+
+    // Include text content along with embeddings
+    const parsedData = documents.map((doc) => ({
+      embedding: doc.embedding,
+      text: doc.parsedText,
+      metadata: {
+        name: doc.name,
+        id: doc._id,
+        fileType: doc.fileType,
+        uploadDate: doc.uploadDate,
+      },
+    }));
+
+    // Perform search in FastAPI with embeddings and text content
+    const searchResponse = await searchInDocuments(query, parsedData);
+
+    res.json({
       status: 'success',
       data: {
-        results: searchResponse.results.map((result) => ({
-          content: result.content,
-          metadata: result.metadata,
-          score: result.score,
-          snippet: result.snippet,
+        results: searchResponse.results?.map((result) => ({
+          ...result,
+          matches: result.matches.map((match) => ({
+            page: match.page_number || 'N/A',
+            score: match?.similarity || 0,
+            content: match.text || 'No Content Found',
+            metadata: {
+              ...match.metadata,
+              similarity: match.similarity,
+            },
+          })),
         })),
-        totalResults: searchResponse.totalResults,
-        query: searchResponse.query,
+        totalResults: searchResponse?.totalResults || 0,
+        query: searchResponse?.query,
       },
     });
   } catch (error) {
-    console.error('Error querying documents:', error.message);
-    return res.status(500).json({
+    res.status(500).json({
       status: 'error',
-      error: 'Failed to query documents',
+      error: 'Failed to search documents',
       message: error.message,
     });
   }
@@ -87,7 +110,6 @@ export const searchDocuments = async (req, res) => {
 
 export const uploadFile = catchAsync(async (req, res, next) => {
   const { file } = req;
-  console.log(file);
 
   if (!file) {
     return next(new AppError('No file uploaded', 400));
@@ -100,27 +122,29 @@ export const uploadFile = catchAsync(async (req, res, next) => {
     });
 
   if (error) {
-    console.log(error);
     return next(new AppError('Failed to upload file to Supabase', 500));
   }
 
   const publicUrl = supabase.storage.from('Aethemis').getPublicUrl(data.path)
     .data.publicUrl;
 
-  // Save document metadata in MongoDB
+  const uploadedDoc = await sendFileToFastAPI(file.buffer, file.originalname);
+  const parsedText = uploadedDoc.parsed_text;
+  const embedding = uploadedDoc.embeddings;
+  // Get the embeddings from FastAPI response
+
+  // Save document metadata, parsed text, and embeddings to MongoDB
   const document = new Document({
     name: file.originalname,
     type: file.mimetype,
     size: file.size,
     url: publicUrl,
     path: data.path,
+    parsedText: parsedText,
+    embedding: embedding,
   });
-  console.log(document);
 
   await document.save();
-
-  // Send the file to FastAPI for processing
-  await sendFileToFastAPI(file.buffer, file.originalname);
 
   res.status(201).json({
     status: 'success',
@@ -130,13 +154,13 @@ export const uploadFile = catchAsync(async (req, res, next) => {
       type: document.type,
       size: document.size,
       url: publicUrl,
+      parsedText: document.parsedText,
     },
   });
 });
 
-// Fetch all documents
 export const getDocuments = catchAsync(async (req, res, next) => {
-  const { ids } = req.body; // Expect an array of document IDs in the request body
+  const { ids } = req.body;
 
   if (!ids || !Array.isArray(ids)) {
     return res.status(400).json({ message: 'Invalid or missing document IDs' });
@@ -147,10 +171,8 @@ export const getDocuments = catchAsync(async (req, res, next) => {
   res.json(documents);
 });
 
-// Delete document
 export const deleteDocument = catchAsync(async (req, res, next) => {
   const document = await Document.findById(req.params.id);
-  console.log(document);
 
   if (!document) {
     return next(new AppError('Document not found', 404));

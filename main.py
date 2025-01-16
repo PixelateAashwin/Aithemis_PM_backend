@@ -1,9 +1,11 @@
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.docstore.document import Document  
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 from pydantic import BaseModel
 import numpy as np
 import os
@@ -22,10 +24,11 @@ vectorstore = None
 
 class SearchQuery(BaseModel):
     query: str
+    parsedData: list 
 
-# Custom embeddings class that uses sentence-transformers directly
+# Use a more advanced model for embeddings
 class CustomEmbeddings:
-    def __init__(self, model_name="distilbert-base-nli-stsb-mean-tokens"):  # Changed model for better performance
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
     
     def embed_documents(self, texts):
@@ -51,12 +54,27 @@ class CustomEmbeddings:
             return self.embed_documents(text)
         return self.embed_query(text)
 
+# Function to normalize embeddings
+def normalize_embeddings(embeddings):
+    """Normalize embeddings to unit vectors"""
+    norm = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return embeddings / norm if norm.all() else embeddings
+
+# Update chunking strategy to preserve context
+def chunk_document(document_text, chunk_size=1000, overlap_size=200):
+    """Chunk the document into semantically aware chunks"""
+    chunks = []
+    for i in range(0, len(document_text), chunk_size - overlap_size):
+        chunk = document_text[i:i + chunk_size]
+        chunks.append(chunk)
+    return chunks
+
 # Initialize embeddings
 try:
     embeddings = CustomEmbeddings()
-    logger.info("Successfully initialized embeddings model")
+    # logger.info("Successfully initialized embeddings model")
 except Exception as e:
-    logger.error(f"Error initializing embeddings: {e}")
+    # logger.error(f"Error initializing embeddings: {e}")
     raise
 
 @app.post("/upload")
@@ -73,19 +91,19 @@ async def upload_file(file: UploadFile = File(...)):
 
         # Load and process the document
         documents = []
+        extracted_text = ""
         if file.filename.endswith('.pdf'):
             loader = PyPDFLoader(temp_path)
             documents = loader.load()
-            logger.info(f"Loaded PDF with {len(documents)} pages")
+            extracted_text = "\n".join(doc.page_content for doc in documents)
+            # logger.info(f"Loaded PDF with {len(documents)} pages")
         elif file.filename.endswith('.docx'):
-    # Load DOCX content
-            content = load_docx(temp_path)
-            # Create Document and set metadata separately
-            doc = Document()  # Initialize without parameters
-            doc.page_content = content  # Set page_content attribute directly
+            extracted_text = load_docx(temp_path)
+            doc = Document()
+            doc.page_content = extracted_text 
             doc.metadata = {"filename": file.filename}
             documents = [doc]
-            logger.info(f"Loaded DOCX with {len(content.splitlines())} paragraphs")
+            # logger.info(f"Loaded DOCX with {len(extracted_text.splitlines())} paragraphs")
 
         # Split documents into chunks
         text_splitter = RecursiveCharacterTextSplitter(
@@ -94,20 +112,25 @@ async def upload_file(file: UploadFile = File(...)):
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = text_splitter.split_documents(documents)
-        logger.info(f"Split into {len(chunks)} chunks")
+        # logger.info(f"Split into {len(chunks)} chunks")
 
-        # Create embeddings and store in FAISS
-        global vectorstore
-        vectorstore = FAISS.from_documents(chunks, embeddings)
-        logger.info("Successfully created FAISS index")
+        # Generate embeddings for the chunks
+        embeddings_list = embeddings.embed_documents([chunk.page_content for chunk in chunks])
+
+        # Create a dictionary with parsed text and embeddings
+        parsed_text = extracted_text
+        embeddings_data = embeddings_list  
 
         # Clean up temporary file
         os.unlink(temp_path)
 
+        # Return both parsed text and embeddings
         return {
             "message": "File uploaded and processed successfully",
             "document_count": len(documents),
-            "chunk_count": len(chunks)
+            "chunk_count": len(chunks),
+            "parsed_text": parsed_text,
+            "embeddings": embeddings_data 
         }
 
     except Exception as e:
@@ -119,31 +142,71 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/search")
 async def search_documents(search_query: SearchQuery):
-    logger.info(f"Received query: {search_query.query}")
-    if not vectorstore:
-        raise HTTPException(
-            status_code=400,
-            detail="No documents have been uploaded yet. Please upload a PDF first."
-        )
-    
     try:
-        # Use similarity_search_with_score to get relevance scores
-        results = vectorstore.similarity_search_with_score(search_query.query, k=5)
-        logger.info(f"Found {len(results)} results")
-        
-        # Normalize scores
-        max_score = max(float(score) for _, score in results)  # Ensure scores are converted to float
-        formatted_results = [{
-            "content": doc.page_content,  # Accessing properties directly
-            "metadata": doc.metadata,
-            "score": float(score) / max_score if max_score > 0 else 0.0,  # Normalize score
-            "snippet": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
-        } for doc, score in results]
-        
+        # Embed the query
+        query_embedding = embeddings.embed_query(search_query.query)
+
+        # Ensure query_embedding is a 2D array (1, embedding_size)
+        query_embedding = np.array(query_embedding).reshape(1, -1)
+
+        # Minimum similarity threshold
+        SIMILARITY_THRESHOLD = 0.1
+
+        results = []
+        # Iterate over parsedData 
+        for doc_data in search_query.parsedData:
+            # Extract embeddings array and text content
+            document_embeddings = np.array(doc_data['embedding'])
+            document_text = doc_data.get('text', '')
+
+            # Ensure document_embeddings is a 2D array
+            document_embeddings = document_embeddings.reshape(-1, len(query_embedding[0]))
+            document_embeddings = normalize_embeddings(document_embeddings)
+
+            # Store all matches above threshold
+            matches = [] 
+            chunk_size = 500
+
+            # Split document text into chunks if available
+            chunks = []
+            if document_text:
+                chunks = [document_text[i:i + chunk_size] for i in range(0, len(document_text), chunk_size)]
+
+            # Calculate similarity for each embedding and store if above threshold
+            similarities = cosine_similarity(query_embedding, document_embeddings)
+
+            for i, similarity in enumerate(similarities[0]):
+                if similarity >= SIMILARITY_THRESHOLD:
+                    match = {
+                        "chunk_index": i,
+                        "page_number": i + 1,  # Assuming 1-based page numbering
+                        "similarity": float(similarity),
+                        "text": chunks[i] if chunks and i < len(chunks) else f"Chunk {i}",
+                        "metadata": doc_data.get('metadata', {}),
+                        "document_name": doc_data['metadata'].get('name', 'Unknown Document'),
+                    }
+                    matches.append(match)
+
+            # Sort matches by similarity
+            matches.sort(key=lambda x: x['similarity'], reverse=True)
+
+            # If we found any matches, add them to results
+            if matches:
+                doc_result = {
+                    "document_name": doc_data['metadata'].get('name', 'Unknown Document'),
+                    "document_metadata": doc_data.get('metadata', {}),
+                    "matches": matches
+                }
+                results.append(doc_result)
+
+        # Sort documents by their best match similarity
+        results.sort(key=lambda x: max(m['similarity'] for m in x['matches']) if x['matches'] else 0, reverse=True)
+
         return {
             "query": search_query.query,
-            "results": formatted_results,
-            "total_results": len(formatted_results)
+            "results": results,
+            "total_results": len(results),
+            "total_matches": sum(len(doc['matches']) for doc in results)
         }
     except Exception as e:
         logger.error(f"Error during search: {str(e)}")
@@ -160,4 +223,4 @@ def load_docx(file_path):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 

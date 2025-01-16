@@ -17,11 +17,16 @@ const documentSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  parsedText: {
+    type: String,
+  },
   url: {
     type: String,
     required: true,
   },
-
+  embedding: {
+    type: [[Number]],
+  },
   uploadedAt: {
     type: Date,
     default: Date.now(),
